@@ -139,3 +139,6 @@ results/
 
 # seeds data
 ipr_seed/
+
+# Config files
+configs/
