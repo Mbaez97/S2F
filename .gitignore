@@ -132,3 +132,10 @@ fabric.properties
 
 # Editor-based Rest Client
 .idea/httpRequests
+
+# Agents file
+AGENTS.md
+GEMINI.md
+CLAUDE.md
+
+results/
