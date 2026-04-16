@@ -3,10 +3,49 @@ import abc
 import numpy as np
 import pandas as pd
 import sklearn.metrics
-from sklearn.metrics._ranking import _binary_clf_curve
+
+try:
+    # Older scikit-learn versions exposed this helper in a private module.
+    from sklearn.metrics._ranking import _binary_clf_curve as _sk_binary_clf_curve
+except Exception:  # pragma: no cover - depends on scikit-learn version
+    _sk_binary_clf_curve = None
 
 from Measures.letor_metrics import ndcg_score
 from Utils import FancyApp
+
+
+def _binary_clf_curve(y_true, y_score, pos_label=1.0):
+    """
+    Compute false/true positives per threshold.
+
+    This keeps compatibility when scikit-learn removes/moves its private
+    `_binary_clf_curve` helper.
+    """
+    if _sk_binary_clf_curve is not None:
+        return _sk_binary_clf_curve(y_true, y_score, pos_label=pos_label)
+
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    if y_true.shape[0] != y_score.shape[0]:
+        raise ValueError('y_true and y_score must have the same number of samples')
+
+    y_true = (y_true == pos_label).astype(np.int8)
+
+    # Sort scores in descending order so cumulative sums define each threshold.
+    order = np.argsort(y_score, kind='mergesort')[::-1]
+    y_score = y_score[order]
+    y_true = y_true[order]
+
+    if y_true.size == 0:
+        return np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=float)
+
+    distinct_value_indices = np.where(np.diff(y_score))[0]
+    threshold_indices = np.r_[distinct_value_indices, y_true.size - 1]
+
+    true_positives = np.cumsum(y_true, dtype=float)[threshold_indices]
+    false_positives = (1 + threshold_indices).astype(float) - true_positives
+    thresholds = y_score[threshold_indices]
+    return false_positives, true_positives, thresholds
 
 
 class S2FMeasure(FancyApp.FancyApp):
