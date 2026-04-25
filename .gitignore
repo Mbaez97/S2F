@@ -148,3 +148,6 @@ ipr_seed/
 
 # Config files
 configs/
+
+# Proteins structures
+structures/
