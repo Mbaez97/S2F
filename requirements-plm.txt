@@ -1,0 +1,9 @@
+# Optional dependencies for the PLM seed (`plm.py`).
+#
+# Install these in the same environment used to run S2F before computing
+# ESM1b embeddings. The main S2F workflow can still run without these packages
+# when `plm_output = skip`.
+torch
+transformers
+pyyaml
+safetensors
