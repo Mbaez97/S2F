@@ -22,6 +22,8 @@ class TransferInteractions(FancyApp.FancyApp):
             Configuration.CONFIG.get('directories', 'installation_directory'))
         self.string_links = Configuration.CONFIG.get('databases',
                                                      'string_links')
+        self.string_core_only = Configuration.CONFIG.getboolean(
+            'databases', 'string_core_only', fallback=False)
         self.string_dir = os.path.join(self.installation_directory,
                                        'data/STRINGSequences')
         self.core_ids = os.path.join(
@@ -32,6 +34,7 @@ class TransferInteractions(FancyApp.FancyApp):
             self.installation_directory, 'graphs/collection')
         self.output_dir = os.path.join(self.installation_directory,
                                        'output', self.alias)
+        os.makedirs(self.output_dir, exist_ok=True)
         self.max_evalue = args.max_evalue
         self.perc = args.perc
         self.positives = args.positives
@@ -68,6 +71,7 @@ class TransferInteractions(FancyApp.FancyApp):
                          self.orthologs_dir, self.graphs_dir, self.alias,
                          self.cpu, None, self.max_evalue, self.perc,
                          self.positives, self.protein_format,
+                         self.string_core_only,
                          recompute_orthologs=self.recompute_orthologs,
                          chunk_size=self.collection_chunk_size
                          )

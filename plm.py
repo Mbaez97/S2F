@@ -714,6 +714,7 @@ def compute_kde_neighbors(
     all_scores: List[List[float]] = []
     all_weights: List[List[float]] = []
     diagnostics: List[Dict[str, object]] = []
+    cap_violations: List[Tuple[int, int]] = []
 
     for start in range(0, query_norm.shape[0], query_chunk_size):
         end = min(start + query_chunk_size, query_norm.shape[0])
@@ -726,12 +727,8 @@ def compute_kde_neighbors(
             selected = np.flatnonzero(row >= minimum_similarity)
             if selected.size > max_neighbors:
                 query_index = start + local_index
-                raise RuntimeError(
-                    f"Gaussian KDE for query row {query_index} has {selected.size} "
-                    f"contributors above the relative floor, exceeding the "
-                    f"{max_neighbors}-donor safety cap. Increase kde_max_neighbors "
-                    "and rerun."
-                )
+                cap_violations.append((query_index, int(selected.size)))
+                continue
             selected_scores = row[selected]
             order = np.argsort(-selected_scores)
             selected = selected[order]
@@ -760,6 +757,14 @@ def compute_kde_neighbors(
         log_info(
             f"Computed PLM KDE contributors for {end:,}/{query_norm.shape[0]:,} "
             "query protein(s)."
+        )
+    if cap_violations:
+        highest_row, highest_count = max(cap_violations, key=lambda item: item[1])
+        raise RuntimeError(
+            f"Gaussian KDE has {len(cap_violations):,} query protein(s) above the "
+            f"{max_neighbors}-donor safety cap; the maximum is {highest_count} "
+            f"contributors at query row {highest_row}. Increase kde_max_neighbors "
+            f"to at least {highest_count} and rerun."
         )
     return all_indices, all_scores, all_weights, diagnostics
 

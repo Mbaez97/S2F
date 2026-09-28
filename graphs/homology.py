@@ -8,9 +8,37 @@ from scipy import sparse
 from graphs import Graph
 from Utils import Utilities
 
+
+def vectorized_homology_graph(homology):
+    """Build the legacy homology weights without Python pairwise loops."""
+    proteins = sorted(homology.keys())
+    protein_index = {protein: index for index, protein in enumerate(proteins)}
+    size = len(proteins)
+    evalues = np.full((size, size), 10.0, dtype=np.float64)
+    for query, subjects in homology.items():
+        query_index = protein_index[query]
+        for subject, evalue in subjects.items():
+            subject_index = protein_index.get(subject)
+            if subject_index is not None:
+                evalues[query_index, subject_index] = evalue
+
+    pair_evalues = np.maximum(evalues, evalues.T)
+    graph = np.zeros_like(pair_evalues)
+    diagonal = np.eye(size, dtype=bool)
+    ones = (pair_evalues == 0) | diagonal
+    graph[ones] = 1.0
+    transform = (~ones) & (pair_evalues > 0) & (pair_evalues < 11)
+    graph[transform] = -np.log(pair_evalues[transform] / 11.0)
+    maxi = graph[transform].max(initial=-1.0)
+    if maxi <= 0:
+        raise RuntimeError('Unable to normalise an empty homology graph')
+    graph[graph != 1] *= 1.0 / maxi
+    return proteins, graph
+
 class Homology(Graph):
 
-    def __init__(self, fasta, proteins, graphs_dir, alias, protein_format, cpu='infer'):
+    def __init__(self, fasta, proteins, graphs_dir, alias, protein_format,
+                 cpu='infer', engine='legacy'):
         super(Homology, self).__init__()
         self.fasta = fasta
         self.proteins = proteins
@@ -19,11 +47,16 @@ class Homology(Graph):
         self.homology_graph = None
         self.protein_format = protein_format
         self.cpu = cpu
+        self.engine = engine
+        if self.engine not in ('legacy', 'vectorized'):
+            raise ValueError('Unknown homology engine: ' + self.engine)
         if self.cpu == 'infer':
             # https://docs.python.org/3/library/os.html#os.cpu_count
             self.cpu = len(os.sched_getaffinity(0))
 
     def get_graph(self, **kwargs):
+        if sparse.issparse(self.homology_graph):
+            return self.homology_graph.tocoo()
         h = self.homology_graph.merge(self.proteins, left_on='Protein 1',
                                       right_index=True)
         h = h.merge(self.proteins, left_on='Protein 2', right_index=True,
@@ -35,11 +68,62 @@ class Homology(Graph):
                                         len(self.proteins)))
 
     def write_graph(self, filename):
+        if sparse.issparse(self.homology_graph):
+            sparse.save_npz(filename, self.homology_graph)
+            return
         Graph.assert_lexicographical_order(self.homology_graph)
         self.homology_graph.to_csv(filename, sep='\t')
 
+    @staticmethod
+    def _atomic_sparse(matrix, filename):
+        temporary = filename + '.tmp.' + str(os.getpid()) + '.npz'
+        try:
+            sparse.save_npz(temporary, matrix)
+            os.replace(temporary, filename)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+
+    def _parse_blast(self, filename):
+        homology = {}
+        for line in open(filename):
+            fields = line.strip().split('\t')
+            query_id = fields[0]
+            subject_id = fields[1]
+            if self.protein_format == 'uniprot':
+                query_id = Utilities.extract_uniprot_accession(query_id)
+                subject_id = Utilities.extract_uniprot_accession(subject_id)
+            evalue = float(fields[10])
+            if query_id not in homology:
+                homology[query_id] = {}
+            if subject_id in homology[query_id]:
+                homology[query_id][subject_id] = np.min([
+                    homology[query_id][subject_id], evalue])
+            else:
+                homology[query_id][subject_id] = evalue
+        return homology
+
+    def _vectorized_sparse_graph(self, homology):
+        ordered_proteins, graph = vectorized_homology_graph(homology)
+        rows, cols = np.triu_indices(len(ordered_proteins))
+        values = graph[rows, cols]
+        mapping = self.proteins['protein idx'].to_dict()
+        order_to_target = np.fromiter(
+            (mapping[name] for name in ordered_proteins), dtype=np.int64,
+            count=len(ordered_proteins))
+        protein_rows = order_to_target[rows]
+        protein_cols = order_to_target[cols]
+        return sparse.coo_matrix(
+            (values, (protein_rows, protein_cols)),
+            shape=(len(self.proteins), len(self.proteins)))
+
     def compute_graph(self):
         homology_graph = os.path.join(self.graphs_dir, self.alias)
+        sparse_graph = homology_graph + '.npz'
+        if self.engine == 'vectorized' and os.path.exists(sparse_graph):
+            self.tell('Vectorized homology graph found, skipping computation...')
+            self.homology_graph = sparse.load_npz(sparse_graph).tocoo()
+            return
         if not os.path.exists(homology_graph):
             self.tell('Computing homology graph...')
             # compute the homology graph
@@ -58,25 +142,13 @@ class Homology(Graph):
                                                      cpu=self.cpu), shell=True)
 
             self.tell('Parsing BLAST output...')
-            # parse the blast output
-            homology = {}
-            for line in open(out):
-                fields = line.strip().split('\t')
-                query_id = fields[0]
-                subject_id = fields[1]
-                if self.protein_format == 'uniprot':
-                    query_id = Utilities.extract_uniprot_accession(query_id)
-                    subject_id = Utilities.extract_uniprot_accession(subject_id)
-                evalue = float(fields[10])
+            homology = self._parse_blast(out)
 
-                if query_id not in homology:
-                    homology[query_id] = {}
-
-                if subject_id in homology[query_id]:
-                    homology[query_id][subject_id] = np.min([
-                        homology[query_id][subject_id], evalue])
-                else:
-                    homology[query_id][subject_id] = evalue
+            if self.engine == 'vectorized':
+                self.tell('Building vectorized homology graph...')
+                self.homology_graph = self._vectorized_sparse_graph(homology)
+                self._atomic_sparse(self.homology_graph, sparse_graph)
+                return
 
             self.tell('Building graph...')
             hom_graph = {'Protein 1': [], 'Protein 2': [], 'weight': []}

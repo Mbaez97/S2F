@@ -1,5 +1,9 @@
 import os
+import gzip
+import shutil
 import subprocess
+import tempfile
+import time
 from multiprocessing import Pool
 
 import numpy as np
@@ -94,10 +98,12 @@ class Collection(Graph):
                  output_dir, orthologs_dir, graphs_dir, alias, cpus, blacklist,
                  max_evalue, perc, positives, protein_format, string_core_only,
                  recompute_orthologs=True,
+                 orthologs_alias=None,
                  interesting_graphs=['neighborhood', 'experiments',
                                      'coexpression', 'textmining',
                                      'database'],
-                 chunk_size=200000):
+                 chunk_size=200000,
+                 engine='legacy'):
         super(Collection, self).__init__()
         self.fasta = fasta
         self.proteins = proteins
@@ -121,9 +127,13 @@ class Collection(Graph):
         self.collection = None
         self.protein_format = protein_format
         self.recompute_orthologs = recompute_orthologs
+        self.orthologs_alias = orthologs_alias or alias
         self._collection_chunks = []
         self._collection_edge_count = 0
         self.chunk_size = chunk_size
+        self.engine = engine
+        if self.engine not in ('legacy', 'native_filter'):
+            raise ValueError('Unknown collection engine: ' + self.engine)
 
     def get_graph(self, **kwargs):
         # It is assumed that the collection was already made
@@ -148,7 +158,7 @@ class Collection(Graph):
             # self.tell('blacklisted')
             return False
         orthologs_filename = os.path.join(self.orthologs_dir,
-                                          self.alias + '_AND_' + string_id)
+                                          self.orthologs_alias + '_AND_' + string_id)
         if not os.path.exists(orthologs_filename):
             # self.tell('ortholog file does not exist')
             return False
@@ -188,7 +198,7 @@ class Collection(Graph):
         self.tell('Transferring links from', string_id)
         # load ortholog file
         orthologs = pd.read_pickle(os.path.join(self.orthologs_dir,
-                                                self.alias + '_AND_' +
+                                                self.orthologs_alias + '_AND_' +
                                                 string_id))
         orthologs['target_evalue'] = orthologs['target_evalue'].astype(float)
         orthologs['query_evalue'] = orthologs['query_evalue'].astype(float)
@@ -237,6 +247,167 @@ class Collection(Graph):
     def write_graph(self, filename):
         self.collection.to_csv(filename, sep='\t')
 
+    def _valid_ortholog_mappings(self):
+        """Load the transfer mappings using the legacy filtering rules."""
+        prefix = self.orthologs_alias + '_AND_'
+        mappings = {}
+        for filename in Path(self.orthologs_dir).glob(prefix + '*'):
+            if filename.name.endswith(('forward', 'backward')):
+                continue
+            string_id = filename.name[len(prefix):]
+            if string_id in self.blacklist:
+                continue
+            orthologs = pd.read_pickle(filename)
+            if orthologs.shape[0] <= 2:
+                continue
+            orthologs = orthologs.copy()
+            orthologs['target_evalue'] = orthologs['target_evalue'].astype(float)
+            orthologs['query_evalue'] = orthologs['query_evalue'].astype(float)
+            # Preserve the legacy implementation exactly: max_evalue is the
+            # query-side value, despite the historical column name.
+            orthologs['max_evalue'] = orthologs['query_evalue'].astype(float)
+            valid = orthologs[
+                (orthologs['max_evalue'] < self.max_evalue) &
+                (orthologs['target_perc'] >= self.perc) &
+                (orthologs['query_perc'] >= self.perc) &
+                (orthologs['pos'] >= self.positives)
+            ]
+            for row in valid[['target', 'query', 'max_evalue']].itertuples(
+                    index=False, name=None):
+                target, query, max_evalue = row
+                mappings.setdefault(str(target), []).append(
+                    (str(query), float(max_evalue)))
+        return mappings
+
+    def _native_filter_command(self, keep_file, graph_indices):
+        pigz = shutil.which('pigz')
+        grep = shutil.which('grep')
+        if pigz is None or grep is None:
+            raise RuntimeError(
+                'native_filter requires both pigz and grep on PATH')
+        decompressor = subprocess.Popen(
+            [pigz, '-dc', self.string_links], stdout=subprocess.PIPE)
+        filtered = subprocess.Popen(
+            [grep, '-F', '-f', keep_file],
+            stdin=decompressor.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=dict(os.environ, LC_ALL='C'))
+        decompressor.stdout.close()
+        return decompressor, filtered
+
+    def _compute_native_collection(self):
+        """Transfer only links whose endpoints have valid ortholog mappings."""
+        started = time.monotonic()
+        mappings = self._valid_ortholog_mappings()
+        self.tell('Native STRING filter loaded', len(mappings),
+                  'valid STRING protein mappings')
+
+        if self.string_links.endswith('.gz'):
+            with gzip.open(self.string_links, 'rt') as links:
+                header = links.readline().strip().split()
+        else:
+            with open(self.string_links, 'r') as links:
+                header = links.readline().strip().split()
+        missing = [g for g in self.interesting_graphs if g not in header]
+        if missing:
+            raise RuntimeError(
+                'STRING links header is missing graph columns: ' +
+                ', '.join(missing))
+        graph_indices = {g: header.index(g) for g in self.interesting_graphs}
+
+        os.makedirs(self.output_dir, exist_ok=True)
+        keep_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    mode='w', prefix=self.alias + '_valid_string_',
+                    suffix='.txt', dir=self.output_dir,
+                    delete=False) as keep:
+                keep_path = keep.name
+                for target in mappings:
+                    # STRING endpoints are whitespace-delimited. Including
+                    # the following space prevents fixed-string prefix hits;
+                    # awk-style field readers still see the same first token.
+                    keep.write(target + ' \n')
+
+            if self.string_links.endswith('.gz'):
+                decompressor, filtered = self._native_filter_command(
+                    keep_path, graph_indices)
+                stream = filtered.stdout
+            else:
+                decompressor = None
+                filtered = subprocess.Popen(
+                    [shutil.which('grep') or 'grep', '-F', '-f', keep_path,
+                     self.string_links],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, env=dict(os.environ, LC_ALL='C'))
+                stream = filtered.stdout
+
+            output = {name: [] for name in
+                      ['query1', 'query2', 'max_evalue'] +
+                      list(self.interesting_graphs)}
+            for line in stream:
+                fields = line.strip().split()
+                left = mappings.get(fields[0], ())
+                right = mappings.get(fields[1], ())
+                if not left or not right:
+                    continue
+                scores = {g: int(fields[graph_indices[g]])
+                          for g in self.interesting_graphs}
+                if not any(scores.values()):
+                    continue
+                for query1, evalue1 in left:
+                    for query2, evalue2 in right:
+                        output['query1'].append(query1)
+                        output['query2'].append(query2)
+                        output['max_evalue'].append(max(evalue1, evalue2))
+                        for graph_name, score in scores.items():
+                            output[graph_name].append(score)
+                        if (self.chunk_size and
+                                len(output['query1']) >= self.chunk_size):
+                            chunk = pd.DataFrame.from_dict(output)
+                            self._collection_chunks.append(chunk)
+                            self._collection_edge_count += len(chunk)
+                            output = {name: [] for name in output}
+                            self.tell('Native transfer collected',
+                                      self._collection_edge_count, 'edges')
+            stream.close()
+            stderr = filtered.stderr.read()
+            filtered.stderr.close()
+            filter_code = filtered.wait()
+            if decompressor is not None:
+                decompress_code = decompressor.wait()
+            else:
+                decompress_code = 0
+            # grep returns 1 when no line matched, which is a valid empty
+            # collection rather than an execution failure.
+            if filter_code not in (0, 1) or decompress_code != 0:
+                raise RuntimeError(
+                    'Native STRING filter failed '
+                    f'(pigz={decompress_code}, grep={filter_code}): {stderr}')
+
+            if output['query1']:
+                chunk = pd.DataFrame.from_dict(output)
+                self._collection_chunks.append(chunk)
+                self._collection_edge_count += len(chunk)
+            self.tell('Native STRING transfer finished with',
+                      self._collection_edge_count, 'edges in',
+                      round(time.monotonic() - started, 1), 'seconds')
+        finally:
+            if keep_path and os.path.exists(keep_path):
+                os.remove(keep_path)
+
+    @staticmethod
+    def _atomic_pickle(dataframe, filename):
+        temporary = filename + '.tmp.' + str(os.getpid())
+        try:
+            dataframe.to_pickle(temporary)
+            os.replace(temporary, filename)
+        finally:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+
     def compute_graph(self):
         collection_file = os.path.join(self.graphs_dir, self.alias)
         if not os.path.exists(collection_file):
@@ -244,9 +415,10 @@ class Collection(Graph):
             self._collection_chunks = []
             self._collection_edge_count = 0
             core_ids = []
-            for line in open(self.core_ids, 'r'):
-                if line != '':
-                    core_ids.append(line.strip())
+            with open(self.core_ids, 'r') as core_file:
+                for line in core_file:
+                    if line != '':
+                        core_ids.append(line.strip())
 
             # check whether the database fot the fasta file is created
             if not (os.path.exists(self.fasta + '.phr') and
@@ -270,7 +442,7 @@ class Collection(Graph):
                 self.tell('Computing Orthologs using', self.cpus, 'cores')
                 for org_id in string_organisms:
                     fasta = os.path.join(self.string_dir, org_id + '.faa')
-                    out = self.alias + '_AND_' + org_id
+                    out = self.orthologs_alias + '_AND_' + org_id
                     params.append([self.fasta, self.db, fasta, fasta, out,
                                    self.orthologs_dir, self.protein_format])
                 if params:
@@ -280,73 +452,58 @@ class Collection(Graph):
                 self.tell('Skipping ortholog recomputation by configuration.')
 
             # once the orthologs are computed, we transfer links from STRING
-            should_process = {}
-            graph_index = {}
-            graph = {}
-            first_line = True
-            current_organism = -1
-            if self.string_links.endswith(".gz"):
-                import gzip
-                links_open = gzip.open
+            if self.engine == 'native_filter':
+                self._compute_native_collection()
             else:
-                links_open = open
+                should_process = {}
+                graph_index = {}
+                graph = {}
+                first_line = True
+                current_organism = -1
+                links_open = gzip.open if self.string_links.endswith('.gz') else open
 
-            with links_open(self.string_links, "rt") as links:
-                for line in links:
-                    fields = line.strip().split()
-                    if first_line:
-                        first_line = False
-
-                        # identify the index of the interesting
-                        # graphs in the STRING file
-                        for i, field in enumerate(fields):
-                            if field in self.interesting_graphs:
-                                graph_index[field] = i
-                    else:
-                        org_id = fields[0].split('.')[0]
-
-                        # check if the current organism should be processed
-                        if org_id not in should_process.keys():
-                            should_process[org_id] =\
-                                self.should_be_processed(org_id)
+                with links_open(self.string_links, 'rt') as links:
+                    for line in links:
+                        fields = line.strip().split()
+                        if first_line:
+                            first_line = False
+                            for i, field in enumerate(fields):
+                                if field in self.interesting_graphs:
+                                    graph_index[field] = i
+                        else:
+                            org_id = fields[0].split('.')[0]
+                            if org_id not in should_process:
+                                should_process[org_id] = \
+                                    self.should_be_processed(org_id)
+                                if not should_process[org_id]:
+                                    self.tell('Ignoring organism', org_id)
                             if not should_process[org_id]:
-                                self.tell('Ignoring organism', org_id)
-                        if not should_process[org_id]:
-                            continue
-
-                        if current_organism == -1:
-                            current_organism = org_id
-                            graph = self.clean_graph()
-                        elif current_organism != org_id:
-                            # flush buffered edges from previous organism
-                            self.tell(f"Flushing buffered edges for {current_organism}")
-                            self._process_graph_buffer(current_organism, graph)
-                            # clean graph and update current organism
-                            graph = self.clean_graph()
-                            current_organism = org_id
-                            self.tell(f"Getting links for {current_organism}")
-
-                        if should_process[org_id]:
+                                continue
+                            if current_organism == -1:
+                                current_organism = org_id
+                                graph = self.clean_graph()
+                            elif current_organism != org_id:
+                                self.tell('Flushing buffered edges for',
+                                          current_organism)
+                                self._process_graph_buffer(current_organism, graph)
+                                graph = self.clean_graph()
+                                current_organism = org_id
+                                self.tell('Getting links for', current_organism)
                             graph['protein 1'].append(fields[0])
                             graph['protein 2'].append(fields[1])
                             for g in self.interesting_graphs:
                                 graph[g].append(int(fields[graph_index[g]]))
-                            if (
-                                self.chunk_size
-                                and len(graph['protein 1']) >= self.chunk_size
-                            ):
-                                self.tell(
-                                    f"Chunk threshold reached ({len(graph['protein 1'])} edges) "
-                                    f"for {current_organism}, processing chunk."
-                                )
+                            if (self.chunk_size and
+                                    len(graph['protein 1']) >= self.chunk_size):
+                                self.tell('Chunk threshold reached',
+                                          len(graph['protein 1']))
                                 self._process_graph_buffer(current_organism, graph)
                                 graph = self.clean_graph()
 
-            # we make sure we don't miss possible links from
-            # the last organism in STRING
-            self.tell("Processing last organism")
-            if current_organism != -1 and should_process.get(current_organism, False):
-                self._process_graph_buffer(current_organism, graph)
+                self.tell('Processing last organism')
+                if (current_organism != -1 and
+                        should_process.get(current_organism, False)):
+                    self._process_graph_buffer(current_organism, graph)
             self.tell("Finished with transfer, ordering...")
             if self._collection_chunks:
                 self.collection = pd.concat(
@@ -358,7 +515,7 @@ class Collection(Graph):
                 self.collection = pd.DataFrame(columns=cols)
             Graph.assert_lexicographical_order(self.collection,
                                                p1='query1', p2='query2')
-            self.collection.to_pickle(os.path.join(collection_file))
+            self._atomic_pickle(self.collection, collection_file)
         else:
             self.tell('Graph collection file found, skipping computation...')
             self.collection = pd.read_pickle(collection_file)
