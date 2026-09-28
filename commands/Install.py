@@ -119,6 +119,9 @@ class Install(FancyApp.FancyApp):
         self.create_directory('data')
         self.create_directory('data/STRINGSequences')
         self.create_directory('data/UniprotKB')
+        self.create_directory('data/PLM')
+        self.create_directory('data/PLM/models')
+        self.create_directory('data/PLM/embeddings')
         self.create_directory('data/UserSequences')
         self.create_directory('graphs')
         self.create_directory('graphs/collection')
@@ -132,6 +135,8 @@ class Install(FancyApp.FancyApp):
         self.create_directory('seeds')
         self.create_directory('seeds/hmmer')
         self.create_directory('seeds/interpro')
+        self.create_directory('seeds/foldseek')
+        self.create_directory('seeds/plm')
 
     def create_directory(self, directory):
         target = os.path.expanduser(os.path.join(self.installation_directory,

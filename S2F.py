@@ -50,6 +50,25 @@ if __name__ == '__main__':
                          help='manually provide HMMer output file and' +
                               ' therefore avoid its computation',
                          default='compute')
+    predict.add_argument('--foldseek-output',
+                         help='provide Foldseek GO assignments file, use '
+                              '`compute` to run the Foldseek script, or '
+                              '`skip` to disable Foldseek',
+                         default='skip')
+    predict.add_argument('--plm-output',
+                         help='provide PLM GO assignments file, use '
+                              '`compute` to run the PLM script, or '
+                              '`skip` to disable PLM',
+                         default='skip')
+    predict.add_argument('--alpha',
+                         help='weight for the InterPro seed',
+                         default=0.9, type=float)
+    predict.add_argument('--beta',
+                         help='weight for the HMMER seed',
+                         default=0.1, type=float)
+    predict.add_argument('--gamma',
+                         help='weight for the Foldseek seed',
+                         default=0.0, type=float)
     predict.add_argument('--transfer-blacklist',
                          help='path to a file that containes a list of ' +
                               'identifiers from which no' +
@@ -83,6 +102,127 @@ if __name__ == '__main__':
                               ' format of this file is: ' +
                               'PROTEIN_ID<tab>GO_ID',
                          default='compute')
+    predict.add_argument('--foldseek-target-db',
+                         help='Foldseek target database used when '
+                              '`--foldseek-output compute` is selected',
+                         default='')
+    predict.add_argument('--foldseek-structure-mode',
+                         help='how Foldseek obtains structures for FASTA '
+                              'inputs',
+                         default='existing',
+                         choices=['existing', 'colabfold'])
+    predict.add_argument('--foldseek-structures-dir',
+                         help='directory used by Foldseek to find or write '
+                              'structures',
+                         default='structures')
+    predict.add_argument('--foldseek-precomputed-tsv',
+                         help='existing raw Foldseek TSV to parse instead of '
+                              'running Foldseek easy-search',
+                         default='')
+    predict.add_argument('--foldseek-search-recursive',
+                         help='search the Foldseek structures directory '
+                              'recursively',
+                         action='store_true')
+    predict.add_argument('--foldseek-prostt5-model',
+                         help='ProstT5 .gguf model or weights directory for '
+                              'Foldseek sequence-only fallback',
+                         default='')
+    predict.add_argument('--foldseek-gpu',
+                         help='Foldseek GPU switch: 1 enables CUDA, 0 disables it',
+                         default='')
+    predict.add_argument('--foldseek-cuda-visible-devices',
+                         help='CUDA device selector for Foldseek, for example 0 or 0,1',
+                         default='')
+    predict.add_argument('--foldseek-alignment-type',
+                         help='Foldseek alignment type',
+                         default=1, type=int, choices=[0, 1])
+    predict.add_argument('--foldseek-evalue-max',
+                         help='maximum Foldseek E-value',
+                         default=1e-5, type=float)
+    predict.add_argument('--foldseek-min-qcov',
+                         help='minimum Foldseek query coverage',
+                         default=0.70, type=float)
+    predict.add_argument('--foldseek-min-tcov',
+                         help='minimum Foldseek target coverage',
+                         default=0.70, type=float)
+    predict.add_argument('--foldseek-min-avg-tm',
+                         help='minimum Foldseek average TM-score',
+                         default=0.50, type=float)
+    predict.add_argument('--foldseek-max-seqs',
+                         help='Foldseek --max-seqs retrieval limit; 0 requests all',
+                         default=0, type=int)
+    predict.add_argument('--foldseek-score-mode',
+                         help='Foldseek GO transfer scoring mode',
+                         default='binary',
+                         choices=['binary', 'support_fraction'])
+    predict.add_argument('--plm-target-fasta',
+                         help='SwissProt FASTA used as the PLM embedding target',
+                         default='')
+    predict.add_argument('--plm-model-name',
+                         help='ESM model name or local path for PLM embeddings',
+                         default='facebook/esm1b_t33_650M_UR50S')
+    predict.add_argument('--plm-model-dir',
+                         help='directory used to cache the PLM model',
+                         default='')
+    predict.add_argument('--plm-embeddings-dir',
+                         help='directory used to cache reusable PLM target embeddings',
+                         default='')
+    predict.add_argument('--plm-device',
+                         help='PLM embedding device: auto, cpu, cuda, cuda:0, ...',
+                         default='auto')
+    predict.add_argument('--plm-knn-k',
+                         help='number of nearest SwissProt embeddings to transfer from',
+                         default=10, type=int)
+    predict.add_argument('--plm-transfer-strategy',
+                         help='PLM donor selection strategy',
+                         default='knn', choices=['knn', 'kde'])
+    predict.add_argument('--plm-long-sequence-mode',
+                         help='how ESM1b handles sequences longer than its token limit',
+                         default='sliding_mean',
+                         choices=['sliding_mean', 'truncate', 'skip'])
+    predict.add_argument('--plm-long-window-size',
+                         help='residue window size for long PLM sequences',
+                         default=1022, type=int)
+    predict.add_argument('--plm-long-overlap',
+                         help='residue overlap between long PLM sequence windows',
+                         default=128, type=int)
+    predict.add_argument('--plm-score-mode',
+                         help='PLM GO transfer scoring mode',
+                         default='all_ones',
+                         choices=['all_ones', 'weighted_support'])
+    predict.add_argument('--plm-exclude-accessions',
+                         help='accessions excluded from the PLM donor pool',
+                         default='')
+    predict.add_argument('--plm-kde-bandwidth',
+                         help='frozen shared Gaussian KDE bandwidth',
+                         default=0.025409690504535225, type=float)
+    predict.add_argument('--plm-kde-weight-floor',
+                         help='relative Gaussian weight floor',
+                         default=1e-6, type=float)
+    predict.add_argument('--plm-kde-max-neighbors',
+                         help='checked KDE donor safety cap',
+                         default=8192, type=int)
+    predict.add_argument('--plm-batch-tokens',
+                         help='approximate PLM token budget per embedding batch',
+                         default=4096, type=int)
+    predict.add_argument('--plm-query-chunk-size',
+                         help='number of query embeddings per exact KNN chunk',
+                         default=64, type=int)
+    predict.add_argument('--plm-local-files-only',
+                         help='load the ESM model only from local cache',
+                         action='store_true')
+    predict.add_argument('--plm-precomputed-target-embeddings',
+                         help='existing target embedding cache directory',
+                         default='')
+    predict.add_argument('--plm-precomputed-query-embeddings',
+                         help='existing query embedding cache directory',
+                         default='')
+    predict.add_argument('--plm-force-target-embeddings',
+                         help='recompute target embeddings even if a cache exists',
+                         action='store_true')
+    predict.add_argument('--plm-force-query-embeddings',
+                         help='recompute query embeddings even if a cache exists',
+                         action='store_true')
     predict.add_argument('-ua', '--unattended',
                          help='The prediction will not be interactive, and '
                               'all configurations will be accepted without '

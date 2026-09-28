@@ -151,3 +151,6 @@ configs/
 
 # Proteins structures
 structures/
+
+# Competitors results
+competitors/

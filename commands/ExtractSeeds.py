@@ -29,6 +29,20 @@ class ExtractSeeds(FancyApp.FancyApp):
                                              '../../seeds/hmmer',
                                              f'{self.alias}.seed.npz'))
         hmmer = hmmer.tocoo()
+        foldseek_path = os.path.join(self.prediction_directory,
+                                     '../../seeds/foldseek',
+                                     f'{self.alias}.seed.npz')
+        foldseek = None
+        if os.path.exists(foldseek_path):
+            self.tell('Loading foldseek seed file')
+            foldseek = sparse.load_npz(foldseek_path).tocoo()
+        plm_path = os.path.join(self.prediction_directory,
+                                '../../seeds/plm',
+                                f'{self.alias}.seed.npz')
+        plm = None
+        if os.path.exists(plm_path):
+            self.tell('Loading PLM seed file')
+            plm = sparse.load_npz(plm_path).tocoo()
         self.tell('saving text version of interpro seed')
         Diffusion._write_results(interpro, proteins, terms,
                                  os.path.join(self.prediction_directory,
@@ -39,4 +53,16 @@ class ExtractSeeds(FancyApp.FancyApp):
                                  os.path.join(self.prediction_directory,
                                               '../../seeds/hmmer',
                                               f'{self.alias}.seed.txt'))
+        if foldseek is not None:
+            self.tell('saving text version of foldseek seed')
+            Diffusion._write_results(foldseek, proteins, terms,
+                                     os.path.join(self.prediction_directory,
+                                                  '../../seeds/foldseek',
+                                                  f'{self.alias}.seed.txt'))
+        if plm is not None:
+            self.tell('saving text version of PLM seed')
+            Diffusion._write_results(plm, proteins, terms,
+                                     os.path.join(self.prediction_directory,
+                                                  '../../seeds/plm',
+                                                  f'{self.alias}.seed.txt'))
         self.tell('done')

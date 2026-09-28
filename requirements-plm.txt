@@ -7,3 +7,6 @@ torch
 transformers
 pyyaml
 safetensors
+
+# Optional notebook dependency for ESM embedding-space analysis.
+umap-learn

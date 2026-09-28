@@ -1,7 +1,9 @@
 import argparse
 import csv
 import gzip
+import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -20,6 +22,8 @@ UNIPROT_ACC_RE = re.compile(
 )
 NON_AA_RE = re.compile(r"[^ACDEFGHIKLMNPQRSTVWY]")
 EMBEDDING_CACHE_VERSION = 1
+TRANSFER_METADATA_VERSION = 1
+TARGET_HEADER_TAXON_RE = re.compile(r"(?:^|\s)OX=(\d+)(?:\s|$)")
 
 
 def log_info(message: str) -> None:
@@ -126,6 +130,17 @@ def fasta_fingerprint(paths: Sequence[Path]) -> List[Dict[str, object]]:
     return fingerprints
 
 
+def cache_fingerprint(path: Optional[str]) -> Dict[str, object]:
+    if not path:
+        return {}
+    cache_dir = Path(path).expanduser()
+    return {
+        name: fasta_fingerprint([cache_dir / name])[0]
+        for name in ("meta.json", "ids.tsv", "embeddings.npy")
+        if (cache_dir / name).is_file()
+    }
+
+
 def build_cache_metadata(
     fasta_paths: Sequence[Path],
     model_name: str,
@@ -147,8 +162,6 @@ def build_cache_metadata(
 
 def metadata_key(metadata: Dict[str, object]) -> str:
     encoded = json.dumps(metadata, sort_keys=True).encode("utf-8")
-    import hashlib
-
     return hashlib.sha1(encoded).hexdigest()[:16]
 
 
@@ -164,7 +177,27 @@ class EmbeddingCache:
 
 def cache_matches(cache_metadata: Dict[str, object], expected: Dict[str, object]) -> bool:
     for key, value in expected.items():
-        if cache_metadata.get(key) != value:
+        cached_value = cache_metadata.get(key)
+        if key == "fasta" and isinstance(cached_value, list) and isinstance(value, list):
+            if len(cached_value) != len(value):
+                return False
+            for cached_item, expected_item in zip(cached_value, value):
+                cached_copy = dict(cached_item)
+                expected_copy = dict(expected_item)
+                cached_path = str(cached_copy.pop("path", ""))
+                expected_path = str(expected_copy.pop("path", ""))
+                cached_candidates = {cached_path}
+                expected_candidates = {expected_path}
+                if cached_path.startswith("/media/"):
+                    cached_candidates.add("/run" + cached_path)
+                if expected_path.startswith("/media/"):
+                    expected_candidates.add("/run" + expected_path)
+                if cached_candidates.isdisjoint(expected_candidates):
+                    return False
+                if cached_copy != expected_copy:
+                    return False
+            continue
+        if cached_value != value:
             return False
     return True
 
@@ -508,13 +541,22 @@ def compute_knn(
     target_embeddings: np.ndarray,
     k: int,
     query_chunk_size: int,
+    excluded_target_indices: Optional[Sequence[int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if k <= 0:
         raise RuntimeError("PLM knn_k must be greater than zero.")
     if target_embeddings.shape[0] == 0:
         raise RuntimeError("Target embedding cache is empty.")
 
-    k = min(k, target_embeddings.shape[0])
+    excluded = np.unique(
+        np.asarray([] if excluded_target_indices is None else excluded_target_indices, dtype=np.int64)
+    )
+    if excluded.size and (excluded.min() < 0 or excluded.max() >= target_embeddings.shape[0]):
+        raise RuntimeError("PLM target exclusion index is outside the embedding cache.")
+    available_targets = target_embeddings.shape[0] - excluded.size
+    if available_targets < 1:
+        raise RuntimeError("No target proteins remain after blacklist exclusion.")
+    k = min(k, available_targets)
     target_norm = normalize_embeddings(target_embeddings)
     query_norm = normalize_embeddings(query_embeddings)
     all_indices = np.zeros((query_norm.shape[0], k), dtype=np.int64)
@@ -523,6 +565,8 @@ def compute_knn(
     for start in range(0, query_norm.shape[0], query_chunk_size):
         end = min(start + query_chunk_size, query_norm.shape[0])
         similarities = query_norm[start:end].dot(target_norm.T)
+        if excluded.size:
+            similarities[:, excluded] = -np.inf
         partition = np.argpartition(-similarities, kth=k - 1, axis=1)[:, :k]
         partition_scores = np.take_along_axis(similarities, partition, axis=1)
         order = np.argsort(-partition_scores, axis=1)
@@ -545,6 +589,179 @@ def read_blacklist(path: Optional[str]) -> Optional[Set[str]]:
             if token:
                 values.add(token)
     return values or None
+
+
+def read_accession_exclusions(path: Optional[str]) -> Optional[Set[str]]:
+    """Read one-accession-per-line files or benchmark CSV/TSV exports."""
+    if not path:
+        return None
+    exclusion_path = Path(path).expanduser()
+    if not exclusion_path.is_file():
+        raise RuntimeError(
+            f"PLM accession exclusion file does not exist: {exclusion_path}"
+        )
+    with open(exclusion_path, "r", encoding="utf-8", newline="") as handler:
+        first_line = handler.readline()
+        handler.seek(0)
+        delimiter = "\t" if "\t" in first_line else ","
+        header = [value.strip() for value in first_line.rstrip("\n").split(delimiter)]
+        accession_columns = (
+            "protein_id", "Protein", "accession", "uniprot_accession"
+        )
+        selected_column = next(
+            (column for column in accession_columns if column in header), None
+        )
+        if selected_column is not None:
+            reader = csv.DictReader(handler, delimiter=delimiter)
+            values = {
+                str(row.get(selected_column, "")).strip()
+                for row in reader
+                if str(row.get(selected_column, "")).strip()
+            }
+        else:
+            values = {
+                line.strip().split()[0]
+                for line in handler
+                if line.strip() and not line.lstrip().startswith("#")
+            }
+    return values or None
+
+
+def blacklisted_target_indices(target_cache: EmbeddingCache, blacklist: Optional[Set[str]]) -> np.ndarray:
+    """Return target-cache rows forbidden before PLM KNN retrieval.
+
+    Filtering only the GOA rows after KNN allows a forbidden close relative to
+    consume a neighbour rank.  Taxon filtering here removes that donor from the
+    cosine search itself, which is the required leakage boundary.
+    """
+    if not blacklist:
+        return np.empty(0, dtype=np.int64)
+    indices = []
+    missing_taxonomy = []
+    for index, (protein_id, header) in enumerate(zip(target_cache.ids, target_cache.headers)):
+        match = TARGET_HEADER_TAXON_RE.search(str(header))
+        if match is None:
+            missing_taxonomy.append(str(protein_id))
+            continue
+        if match.group(1) in blacklist:
+            indices.append(index)
+    if missing_taxonomy:
+        raise RuntimeError(
+            "Cannot apply the PLM taxon blacklist before KNN because target headers lack OX taxonomy "
+            f"for {len(missing_taxonomy)} proteins (for example {missing_taxonomy[:5]})."
+        )
+    return np.asarray(indices, dtype=np.int64)
+
+
+def excluded_accession_indices(
+    target_cache: EmbeddingCache, accessions: Optional[Set[str]]
+) -> np.ndarray:
+    if not accessions:
+        return np.empty(0, dtype=np.int64)
+    return np.asarray(
+        [
+            index
+            for index, protein_id in enumerate(target_cache.ids)
+            if protein_id in accessions
+        ],
+        dtype=np.int64,
+    )
+
+
+def relative_gaussian_kde_weights(
+    similarities: Sequence[float], bandwidth: float
+) -> np.ndarray:
+    if bandwidth <= 0:
+        raise RuntimeError("PLM kde_bandwidth must be greater than zero.")
+    scores = np.asarray(similarities, dtype=np.float64)
+    if scores.size == 0:
+        return np.asarray([], dtype=np.float64)
+    distances = np.clip(1.0 - scores, 0.0, 2.0)
+    return np.exp(
+        -(distances - float(np.min(distances))) / (bandwidth * bandwidth)
+    )
+
+
+def compute_kde_neighbors(
+    query_embeddings: np.ndarray,
+    target_embeddings: np.ndarray,
+    bandwidth: float,
+    weight_floor: float,
+    max_neighbors: int,
+    query_chunk_size: int,
+    excluded_target_indices: Optional[Sequence[int]] = None,
+) -> Tuple[List[List[int]], List[List[float]], List[List[float]], List[Dict[str, object]]]:
+    """Select all Gaussian contributors above the checked relative floor."""
+    if bandwidth <= 0:
+        raise RuntimeError("PLM kde_bandwidth must be greater than zero.")
+    if not 0.0 < weight_floor < 1.0:
+        raise RuntimeError("PLM kde_weight_floor must be strictly between zero and one.")
+    if max_neighbors <= 0:
+        raise RuntimeError("PLM kde_max_neighbors must be greater than zero.")
+    excluded = np.unique(
+        np.asarray(
+            [] if excluded_target_indices is None else excluded_target_indices,
+            dtype=np.int64,
+        )
+    )
+    available_targets = target_embeddings.shape[0] - excluded.size
+    if available_targets < 1:
+        raise RuntimeError("No target proteins remain after PLM exclusions.")
+    target_norm = normalize_embeddings(target_embeddings)
+    query_norm = normalize_embeddings(query_embeddings)
+    relative_radius = -bandwidth * bandwidth * math.log(weight_floor)
+    all_indices: List[List[int]] = []
+    all_scores: List[List[float]] = []
+    all_weights: List[List[float]] = []
+    diagnostics: List[Dict[str, object]] = []
+
+    for start in range(0, query_norm.shape[0], query_chunk_size):
+        end = min(start + query_chunk_size, query_norm.shape[0])
+        similarities = query_norm[start:end].dot(target_norm.T)
+        if excluded.size:
+            similarities[:, excluded] = -np.inf
+        for local_index, row in enumerate(similarities):
+            nearest_similarity = float(np.max(row))
+            minimum_similarity = nearest_similarity - relative_radius
+            selected = np.flatnonzero(row >= minimum_similarity)
+            if selected.size > max_neighbors:
+                query_index = start + local_index
+                raise RuntimeError(
+                    f"Gaussian KDE for query row {query_index} has {selected.size} "
+                    f"contributors above the relative floor, exceeding the "
+                    f"{max_neighbors}-donor safety cap. Increase kde_max_neighbors "
+                    "and rerun."
+                )
+            selected_scores = row[selected]
+            order = np.argsort(-selected_scores)
+            selected = selected[order]
+            selected_scores = selected_scores[order]
+            weights = relative_gaussian_kde_weights(selected_scores, bandwidth)
+            all_indices.append(selected.astype(int).tolist())
+            all_scores.append(selected_scores.astype(float).tolist())
+            all_weights.append(weights.astype(float).tolist())
+            weight_sum = float(np.sum(weights))
+            squared_sum = float(np.sum(np.square(weights)))
+            diagnostics.append(
+                {
+                    "retained_neighbor_count": int(selected.size),
+                    "nearest_cosine_distance": 1.0 - nearest_similarity,
+                    "relative_distance_radius": relative_radius,
+                    "absolute_distance_threshold": 1.0 - minimum_similarity,
+                    "retained_kernel_weight": weight_sum,
+                    "effective_sample_size": (
+                        weight_sum * weight_sum / squared_sum
+                        if squared_sum > 0
+                        else 0.0
+                    ),
+                    "neighbor_cap_applied": False,
+                }
+            )
+        log_info(
+            f"Computed PLM KDE contributors for {end:,}/{query_norm.shape[0]:,} "
+            "query protein(s)."
+        )
+    return all_indices, all_scores, all_weights, diagnostics
 
 
 def load_go_terms_for_accessions(
@@ -606,14 +823,20 @@ def write_neighbors(
     output_path: Path,
     query_cache: EmbeddingCache,
     target_cache: EmbeddingCache,
-    neighbor_indices: np.ndarray,
-    neighbor_scores: np.ndarray,
+    neighbor_indices: Sequence[Sequence[int]],
+    neighbor_scores: Sequence[Sequence[float]],
+    neighbor_weights: Optional[Sequence[Sequence[float]]] = None,
 ) -> Set[str]:
     wanted_accessions: Set[str] = set()
     with open(output_path, "w", newline="", encoding="utf-8") as handler:
         writer = csv.writer(handler, delimiter="\t")
-        writer.writerow(["Protein", "Neighbor", "Rank", "Cosine"])
+        writer.writerow(["Protein", "Neighbor", "Rank", "Cosine", "Weight"])
         for query_index, query_id in enumerate(query_cache.ids):
+            weights = (
+                neighbor_scores[query_index]
+                if neighbor_weights is None
+                else neighbor_weights[query_index]
+            )
             for rank, target_index in enumerate(neighbor_indices[query_index], start=1):
                 neighbor_id = target_cache.ids[int(target_index)]
                 wanted_accessions.add(neighbor_id)
@@ -622,7 +845,8 @@ def write_neighbors(
                         query_id,
                         neighbor_id,
                         rank,
-                        f"{float(neighbor_scores[query_index, rank - 1]):.8f}",
+                        f"{float(neighbor_scores[query_index][rank - 1]):.8f}",
+                        f"{float(weights[rank - 1]):.8f}",
                     ]
                 )
     return wanted_accessions
@@ -631,35 +855,58 @@ def write_neighbors(
 def build_direct_assignments(
     query_cache: EmbeddingCache,
     target_cache: EmbeddingCache,
-    neighbor_indices: np.ndarray,
-    neighbor_scores: np.ndarray,
+    neighbor_indices: Sequence[Sequence[int]],
+    neighbor_scores: Sequence[Sequence[float]],
     accession_to_terms: Dict[str, Set[str]],
     outdir: Path,
+    score_mode: str = "all_ones",
+    neighbor_weights: Optional[Sequence[Sequence[float]]] = None,
+    diagnostics: Optional[Sequence[Dict[str, object]]] = None,
 ) -> List[Dict[str, object]]:
     direct_rows: List[Dict[str, object]] = []
     for query_index, query_id in enumerate(query_cache.ids):
-        go_terms: Set[str] = set()
+        term_weights: Dict[str, float] = defaultdict(float)
         summary_neighbors = []
+        weights = (
+            neighbor_scores[query_index]
+            if neighbor_weights is None
+            else neighbor_weights[query_index]
+        )
+        denominator = sum(max(float(weight), 0.0) for weight in weights)
         for rank, target_index in enumerate(neighbor_indices[query_index], start=1):
             neighbor_id = target_cache.ids[int(target_index)]
             terms = sorted(accession_to_terms.get(neighbor_id, set()))
-            go_terms.update(terms)
+            weight = max(float(weights[rank - 1]), 0.0)
+            for go_id in terms:
+                term_weights[go_id] += weight
             summary_neighbors.append(
                 {
                     "neighbor": neighbor_id,
                     "rank": rank,
-                    "cosine": float(neighbor_scores[query_index, rank - 1]),
+                    "cosine": float(neighbor_scores[query_index][rank - 1]),
+                    "weight": weight,
                     "go_count": len(terms),
                 }
             )
-        for go_id in sorted(go_terms):
-            direct_rows.append({"Protein": query_id, "GO ID": go_id, "Score": 1.0})
+        for go_id in sorted(term_weights):
+            score = 1.0
+            if score_mode == "weighted_support":
+                score = term_weights[go_id] / denominator if denominator > 0 else 0.0
+            elif score_mode != "all_ones":
+                raise RuntimeError(f"Unsupported PLM score mode: {score_mode}")
+            if score > 0:
+                direct_rows.append(
+                    {"Protein": query_id, "GO ID": go_id, "Score": float(score)}
+                )
 
         summary = {
             "protein_id": query_id,
             "neighbors": summary_neighbors,
-            "direct_go_count": len(go_terms),
+            "direct_go_count": len(term_weights),
+            "score_mode": score_mode,
         }
+        if diagnostics is not None:
+            summary["transfer_diagnostics"] = diagnostics[query_index]
         summary_path = outdir / f"{safe_filename(query_id)}.summary.json"
         with open(summary_path, "w", encoding="utf-8") as handler:
             json.dump(summary, handler, indent=2, sort_keys=True)
@@ -686,18 +933,38 @@ def write_propagated_assignments(go, direct_rows: List[Dict[str, object]], out_p
         log_warn("PLM transfer produced no direct GO assignments.")
         return
 
+    started_at = time.monotonic()
+    log_info(
+        f"Materializing {len(direct_rows):,} direct PLM assignment row(s) "
+        "for deduplication."
+    )
     direct_df = pd.DataFrame(direct_rows)
+    log_info(
+        f"Deduplicating {len(direct_df):,} direct PLM assignment row(s) by "
+        "protein and GO term."
+    )
     direct_df = direct_df.groupby(["Protein", "GO ID"], as_index=False)["Score"].max()
     log_info(
-        f"Up-propagating {len(direct_df):,} direct PLM assignment row(s)."
+        f"Deduplicated to {len(direct_df):,} direct PLM assignment row(s) in "
+        f"{time.monotonic() - started_at:.1f} seconds."
     )
+    log_info("Loading direct PLM assignments into the Gene Ontology.")
     go.load_annotations(direct_df, "PLM seed")
+    log_info("Up-propagating PLM assignments through the Gene Ontology.")
     go.up_propagate_annotations("PLM seed")
+    log_info("Collecting propagated PLM assignments.")
     propagated = go.get_annotations("PLM seed")
     propagated = propagated[["Protein", "GO ID", "Score"]]
+    log_info(
+        f"Deduplicating {len(propagated):,} propagated PLM assignment row(s)."
+    )
     propagated = propagated.groupby(["Protein", "GO ID"], as_index=False)["Score"].max()
+    log_info(f"Writing propagated PLM assignments to {out_path}.")
     propagated.to_csv(out_path, sep="\t", index=False)
-    log_info(f"Wrote {len(propagated):,} propagated PLM assignment row(s) to {out_path}.")
+    log_info(
+        f"Wrote {len(propagated):,} propagated PLM assignment row(s) to "
+        f"{out_path} in {time.monotonic() - started_at:.1f} seconds."
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -728,6 +995,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
     parser.add_argument("--knn-k", type=int, default=10, help="number of nearest SwissProt proteins")
     parser.add_argument(
+        "--transfer-strategy", choices=["knn", "kde"], default="knn"
+    )
+    parser.add_argument(
         "--long-sequence-mode",
         choices=["sliding_mean", "truncate", "skip"],
         default="sliding_mean",
@@ -737,7 +1007,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--long-overlap", type=int, default=128)
     parser.add_argument(
         "--score-mode",
-        choices=["all_ones"],
+        choices=["all_ones", "weighted_support"],
         default="all_ones",
         help="GO transfer scoring mode",
     )
@@ -750,6 +1020,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-query-embeddings", action="store_true")
     parser.add_argument("--download-model-only", action="store_true")
     parser.add_argument("--blacklist", default="", help="optional taxon blacklist")
+    parser.add_argument(
+        "--exclude-accessions",
+        default="",
+        help="optional one-per-line or CSV/TSV accession exclusion set",
+    )
+    parser.add_argument("--kde-bandwidth", type=float, default=0.025409690504535225)
+    parser.add_argument("--kde-weight-floor", type=float, default=1e-6)
+    parser.add_argument("--kde-max-neighbors", type=int, default=8192)
     parser.add_argument(
         "--evidence-codes",
         default="EXP,IDA,IPI,IMP,IGI,IEP,TAS,IC",
@@ -785,6 +1063,8 @@ def main() -> None:
 
     if args.knn_k <= 0:
         raise RuntimeError("--knn-k must be greater than zero.")
+    if args.transfer_strategy == "kde" and args.score_mode != "weighted_support":
+        raise RuntimeError("KDE transfer requires --score-mode weighted_support.")
     if args.batch_tokens <= 0:
         raise RuntimeError("--batch-tokens must be greater than zero.")
     if args.query_chunk_size <= 0:
@@ -868,12 +1148,51 @@ def main() -> None:
             force=args.force_query_embeddings,
         )
 
-    neighbor_indices, neighbor_scores = compute_knn(
-        query_cache.embeddings,
-        target_cache.embeddings,
-        args.knn_k,
-        args.query_chunk_size,
+    blacklist = read_blacklist(args.blacklist) if args.blacklist else None
+    excluded_accessions = read_accession_exclusions(args.exclude_accessions)
+    blacklist_indices = blacklisted_target_indices(target_cache, blacklist)
+    accession_indices = excluded_accession_indices(
+        target_cache, excluded_accessions
     )
+    excluded_target_indices = np.unique(
+        np.concatenate((blacklist_indices, accession_indices))
+    )
+    if blacklist:
+        log_info(
+            f"Excluding {len(blacklist_indices):,} SwissProt target protein(s) from PLM transfer "
+            f"before neighbour selection using {len(blacklist):,} blacklist taxon ID(s)."
+        )
+    if excluded_accessions:
+        log_info(
+            f"Excluding {len(accession_indices):,} SwissProt target protein(s) "
+            f"matching {len(excluded_accessions):,} configured accession(s)."
+        )
+
+    diagnostics = None
+    neighbor_weights = None
+    if args.transfer_strategy == "knn":
+        neighbor_indices, neighbor_scores = compute_knn(
+            query_cache.embeddings,
+            target_cache.embeddings,
+            args.knn_k,
+            args.query_chunk_size,
+            excluded_target_indices=excluded_target_indices,
+        )
+    else:
+        (
+            neighbor_indices,
+            neighbor_scores,
+            neighbor_weights,
+            diagnostics,
+        ) = compute_kde_neighbors(
+            query_cache.embeddings,
+            target_cache.embeddings,
+            args.kde_bandwidth,
+            args.kde_weight_floor,
+            args.kde_max_neighbors,
+            args.query_chunk_size,
+            excluded_target_indices=excluded_target_indices,
+        )
     neighbors_path = outdir / "neighbors.tsv"
     wanted_accessions = write_neighbors(
         neighbors_path,
@@ -881,6 +1200,7 @@ def main() -> None:
         target_cache,
         neighbor_indices,
         neighbor_scores,
+        neighbor_weights=neighbor_weights,
     )
     log_info(
         f"Wrote PLM nearest neighbors to {neighbors_path}; "
@@ -891,7 +1211,7 @@ def main() -> None:
         go,
         goa_path,
         wanted_accessions,
-        blacklist=read_blacklist(args.blacklist) if args.blacklist else None,
+        blacklist=blacklist,
         evidence_codes={
             code.strip() for code in args.evidence_codes.split(",") if code.strip()
         } if args.evidence_codes else None,
@@ -903,8 +1223,51 @@ def main() -> None:
         neighbor_scores,
         accession_to_terms,
         outdir,
+        score_mode=args.score_mode,
+        neighbor_weights=neighbor_weights,
+        diagnostics=diagnostics,
     )
     write_propagated_assignments(go, direct_rows, outdir / "assignments.tsv")
+    request = {
+        "transfer_strategy": args.transfer_strategy,
+        "knn_k": args.knn_k,
+        "score_mode": args.score_mode,
+        "kde_bandwidth": args.kde_bandwidth,
+        "kde_weight_floor": args.kde_weight_floor,
+        "kde_max_neighbors": args.kde_max_neighbors,
+        "blacklist": str(Path(args.blacklist).expanduser().resolve()) if args.blacklist else "",
+        "exclude_accessions": str(Path(args.exclude_accessions).expanduser().resolve()) if args.exclude_accessions else "",
+    }
+    parameters = {
+        **request,
+        "target_cache": str(target_cache.path.resolve()),
+        "query_cache": str(query_cache.path.resolve()),
+        "excluded_target_count": int(len(excluded_target_indices)),
+    }
+    transfer_metadata = {
+        "version": TRANSFER_METADATA_VERSION,
+        "request": request,
+        "input_fingerprints": {
+            "query_fasta": fasta_fingerprint(fasta_paths),
+            "target_fasta": fasta_fingerprint([target_fasta]),
+            "goa": fasta_fingerprint([goa_path]),
+            "go_obo": fasta_fingerprint([go_obo]),
+            "blacklist": fasta_fingerprint([Path(args.blacklist).expanduser()]) if args.blacklist else [],
+            "exclude_accessions": fasta_fingerprint([Path(args.exclude_accessions).expanduser()]) if args.exclude_accessions else [],
+            "precomputed_target_embeddings": cache_fingerprint(args.precomputed_target_embeddings),
+            "precomputed_query_embeddings": cache_fingerprint(args.precomputed_query_embeddings),
+        },
+        "parameters": parameters,
+        "signature": hashlib.sha256(
+            json.dumps(parameters, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "query_count": len(query_cache.ids),
+        "target_count": len(target_cache.ids),
+        "direct_assignment_count": len(direct_rows),
+    }
+    with open(outdir / "transfer_metadata.json", "w", encoding="utf-8") as handler:
+        json.dump(transfer_metadata, handler, indent=2, sort_keys=True)
+        handler.write("\n")
 
 
 if __name__ == "__main__":
