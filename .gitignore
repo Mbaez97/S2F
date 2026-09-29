@@ -154,3 +154,8 @@ structures/
 
 # Competitors results
 competitors/
+
+# configuration path
+conf/*
+
+data/
