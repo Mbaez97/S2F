@@ -207,8 +207,15 @@ The implementation enforces:
 
 `hmmer_blacklist` is a GOA taxon blacklist. When it points to a file, HMMER,
 Foldseek, and PLM use it during GO-transfer from SwissProt/GOA annotations.
-It does not change the HMMER or Foldseek search itself; it only prevents
-annotations from blacklisted taxons from being transferred.
+For PLM, it also removes Swiss-Prot embeddings whose FASTA `OX=` taxon is
+blacklisted **before KNN neighbour ranking**, so a forbidden close relative
+cannot consume a neighbour rank. HMMER and Foldseek retain their search result
+lists but prevent blacklisted GOA annotations from being transferred.
+
+An explicitly configured blacklist now fails closed: a missing file raises an
+error instead of silently running an unfiltered transfer. Legacy `/media/...`
+configuration paths are resolved to `/run/media/...` when that is the active
+mount location.
 
 `transfer_blacklist` is a STRING organism blacklist. It is used by graph
 collection transfer to skip blacklisted STRING organisms when transferring
