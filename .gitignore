@@ -159,3 +159,7 @@ competitors/
 conf/*
 
 data/
+
+figures/
+
+notebooks/exports/
